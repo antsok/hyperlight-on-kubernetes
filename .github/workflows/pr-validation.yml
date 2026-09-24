@@ -41,6 +41,10 @@ jobs:
       - name: Run linters
         run: just lint-strict
 
+      - name: Test device readiness and recovery
+        working-directory: device-plugin
+        run: go test -race -count=1 -timeout=90s ./...
+
   build:
     name: Build
     runs-on: ubuntu-latest

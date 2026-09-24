@@ -41,15 +41,15 @@ On startup, the plugin:
 ### ListAndWatch
 
 Reports device health to kubelet:
-- Sends initial device list on startup
-- Runs a health check every 30 seconds (required by the API, though the device shouldn't disappear in practice)
-- Kubelet updates node capacity accordingly
+- Validates device usability and the plugin-owned CDI specification before sending the initial device list.
+- Repeats validation every 30 seconds; failed validation marks every allocation unhealthy.
+- Repairs missing, malformed or stale CDI and restores healthy advertisement after validation succeeds. Kubelet updates allocatable resources accordingly.
 
 ### Allocate
 
 When a pod requests `hyperlight.dev/hypervisor`:
 1. Kubelet calls the plugin's `Allocate()` method
-2. Plugin returns a CDI device reference
+2. Plugin rechecks device usability and CDI, rejects unknown allocation IDs, then returns a CDI device reference
 3. containerd reads the CDI spec and mounts the device
 
 ## CDI (Container Device Interface)
@@ -86,6 +86,18 @@ Written to `/var/run/cdi/hyperlight.json`:
   ]
 }
 ```
+
+### Readiness and repair
+
+The plugin owns only `/var/run/cdi/hyperlight.json`. Its exact configured specification includes the CDI kind, device name, path, permissions, UID/GID and environment. Drift, including additional container edits, is replaced using a temporary file in the same directory followed by an atomic rename. Readers see either complete version. Other CDI files are untouched; a symlink or non-regular owned path is refused. An unreadable or unwritable directory remains unhealthy until the operator restores access. CDI repair does not modify host device ownership or permissions or terminate existing guests.
+
+For KVM, a helper opens the character device read/write, verifies API version 12, creates an empty VM and closes it without allocating guest memory or vCPUs. See the [Linux KVM API](https://docs.kernel.org/virt/kvm/api.html). Each helper has a two-second deadline. If a kernel operation prevents it from exiting, the plugin refuses further probes until that helper is reaped rather than accumulating processes. MSHV currently receives a character-device/open check only; this does not establish successful MSHV VM creation.
+
+The trusted plugin must itself be permitted to open the hypervisor by host permissions, its device cgroup and its security policy. A host `/dev` directory mount alone does not grant device-cgroup access. Denial fails readiness; the plugin does not change permissions or elevate itself. Verify this access on the intended runtime before deploying this version. The probe establishes usability for the plugin, not admission or device access for every application security context; fresh guest execution remains a separate acceptance check.
+
+The liveness probe performs a gRPC health request to the running server. Readiness additionally requires a successful, deadline-bounded kubelet registration, an active `ListAndWatch` stream and a successful readiness check. Socket existence alone satisfies neither probe. Registration failures stop the attempted server before retrying; kubelet socket cleanup causes the server to be recreated and registered again.
+
+Offline regression checks run with `cd device-plugin && go test -race -count=1 -timeout=90s ./...`. Live acceptance must separately verify existing guests and fresh allocations while removing or corrupting only the owned CDI file, making its storage temporarily unwritable, denying device access, and restarting kubelet. Restore the exact original state and verify recovery and application-owner cleanup. These tests do not establish production capacity or node fencing.
 
 ### Device Injection
 

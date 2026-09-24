@@ -17,20 +17,27 @@ limitations under the License.
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 )
@@ -46,11 +53,22 @@ const (
 )
 
 type HyperlightDevicePlugin struct {
-	devices    []*pluginapi.Device
-	server     *grpc.Server
-	devicePath string
-	hypervisor string
-	stopCh     chan struct{}
+	devices             []*pluginapi.Device
+	server              *grpc.Server
+	hypervisor          string
+	stopCh              chan struct{}
+	mu                  sync.Mutex
+	cdiPath             string
+	cdiSpec             []byte
+	probe               func(context.Context) error
+	healthServer        *health.Server
+	registered          bool
+	watchers            int
+	readinessErr        error
+	socket              string
+	kubeletSocket       string
+	interval            time.Duration
+	registrationTimeout time.Duration
 	pluginapi.UnimplementedDevicePluginServer
 }
 
@@ -69,11 +87,6 @@ func NewHyperlightDevicePlugin() (*HyperlightDevicePlugin, error) {
 	}
 
 	klog.Infof("Detected hypervisor: %s at %s", hypervisor, devicePath)
-
-	// Create CDI spec
-	if err := writeCDISpec(hypervisor, devicePath); err != nil {
-		return nil, fmt.Errorf("failed to write CDI spec: %v", err)
-	}
 
 	// Get device count from environment, default to 2000
 	// This represents concurrent allocations, not physical devices.
@@ -94,20 +107,28 @@ func NewHyperlightDevicePlugin() (*HyperlightDevicePlugin, error) {
 	for i := 0; i < numDevices; i++ {
 		devices[i] = &pluginapi.Device{
 			ID:     fmt.Sprintf("%s-%d", hypervisor, i),
-			Health: pluginapi.Healthy,
+			Health: pluginapi.Unhealthy,
 		}
 	}
 	klog.Infof("Advertising %d hypervisor devices (configurable via DEVICE_COUNT)", numDevices)
 
-	return &HyperlightDevicePlugin{
-		devices:    devices,
-		devicePath: devicePath,
-		hypervisor: hypervisor,
-		stopCh:     make(chan struct{}),
-	}, nil
+	p := &HyperlightDevicePlugin{
+		devices:             devices,
+		hypervisor:          hypervisor,
+		stopCh:              make(chan struct{}),
+		cdiPath:             cdiSpecPath,
+		cdiSpec:             desiredCDISpec(hypervisor, devicePath),
+		socket:              serverSock,
+		kubeletSocket:       kubeletSock,
+		interval:            30 * time.Second,
+		registrationTimeout: 5 * time.Second,
+	}
+	probe := &deviceProbe{}
+	p.probe = func(ctx context.Context) error { return probe.check(ctx, hypervisor, devicePath) }
+	return p, nil
 }
 
-func writeCDISpec(hypervisor, devicePath string) error {
+func desiredCDISpec(hypervisor, devicePath string) []byte {
 	// Get UID/GID from environment, default to 65534 (nobody)
 	// These control the ownership of the device node inside containers
 	uid := defaultDeviceUID
@@ -155,14 +176,7 @@ func writeCDISpec(hypervisor, devicePath string) error {
   ]
 }`, hypervisor, devicePath, uid, gid, hypervisor, devicePath)
 
-	if err := os.MkdirAll(filepath.Dir(cdiSpecPath), 0755); err != nil {
-		return err
-	}
-	if err := os.WriteFile(cdiSpecPath, []byte(spec), 0644); err != nil {
-		return err
-	}
-	klog.Infof("CDI spec written to %s", cdiSpecPath)
-	return nil
+	return []byte(spec)
 }
 
 // GetDevicePluginOptions returns options for the device plugin
@@ -175,38 +189,41 @@ func (p *HyperlightDevicePlugin) GetDevicePluginOptions(ctx context.Context, req
 
 // ListAndWatch lists devices and watches for changes
 func (p *HyperlightDevicePlugin) ListAndWatch(req *pluginapi.Empty, srv pluginapi.DevicePlugin_ListAndWatchServer) error {
-	klog.Infof("ListAndWatch called, sending %d devices", len(p.devices))
-
-	if err := srv.Send(&pluginapi.ListAndWatchResponse{Devices: p.devices}); err != nil {
-		return err
-	}
-
-	// Health check loop
-	ticker := time.NewTicker(30 * time.Second)
+	p.mu.Lock()
+	p.watchers++
+	stop := p.stopCh
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		p.watchers--
+		p.updateReadinessLocked()
+	}()
+	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()
-
+	previous := ""
 	for {
+		state := pluginapi.Healthy
+		if err := p.checkReadiness(srv.Context()); err != nil {
+			state = pluginapi.Unhealthy
+			klog.Warningf("Allocation readiness failed: %v", err)
+		}
+		if state != previous {
+			devices := make([]*pluginapi.Device, len(p.devices))
+			for i, device := range p.devices {
+				devices[i] = &pluginapi.Device{ID: device.ID, Health: state}
+			}
+			if err := srv.Send(&pluginapi.ListAndWatchResponse{Devices: devices}); err != nil {
+				return err
+			}
+			previous = state
+		}
 		select {
-		case <-p.stopCh:
+		case <-stop:
 			return nil
+		case <-srv.Context().Done():
+			return srv.Context().Err()
 		case <-ticker.C:
-			health := pluginapi.Healthy
-			if _, err := os.Stat(p.devicePath); err != nil {
-				health = pluginapi.Unhealthy
-				klog.Warningf("Device %s not found, marking all devices unhealthy", p.devicePath)
-			}
-
-			// Check if health changed (compare against first device as representative)
-			if p.devices[0].Health != health {
-				// Update ALL devices - they all share the same underlying hypervisor device
-				for i := range p.devices {
-					p.devices[i].Health = health
-				}
-				klog.Infof("Device health changed to %s for all %d devices", health, len(p.devices))
-				if err := srv.Send(&pluginapi.ListAndWatchResponse{Devices: p.devices}); err != nil {
-					return err
-				}
-			}
 		}
 	}
 }
@@ -214,6 +231,23 @@ func (p *HyperlightDevicePlugin) ListAndWatch(req *pluginapi.Empty, srv pluginap
 // Allocate allocates devices to a container
 func (p *HyperlightDevicePlugin) Allocate(ctx context.Context, req *pluginapi.AllocateRequest) (*pluginapi.AllocateResponse, error) {
 	klog.V(2).Infof("Allocate called for %d containers", len(req.ContainerRequests))
+	if err := p.checkReadiness(ctx); err != nil {
+		return nil, status.Errorf(codes.Unavailable, "hypervisor allocation is not ready: %v", err)
+	}
+	for _, container := range req.ContainerRequests {
+		for _, id := range container.DevicesIds {
+			found := false
+			for _, device := range p.devices {
+				if device.ID == id {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return nil, status.Errorf(codes.InvalidArgument, "unknown device %q", id)
+			}
+		}
+	}
 
 	responses := make([]*pluginapi.ContainerAllocateResponse, len(req.ContainerRequests))
 
@@ -243,77 +277,179 @@ func (p *HyperlightDevicePlugin) GetPreferredAllocation(ctx context.Context, req
 }
 
 func (p *HyperlightDevicePlugin) Start() error {
-	// Reset stop channel for restart scenarios
+	p.mu.Lock()
 	p.stopCh = make(chan struct{})
-
-	// Remove old socket
-	if err := os.Remove(serverSock); err != nil && !os.IsNotExist(err) {
-		klog.Warningf("Failed to remove old socket: %v", err)
+	p.registered = false
+	p.healthServer = health.NewServer()
+	p.updateReadinessLocked()
+	p.mu.Unlock()
+	if err := os.Remove(p.socket); err != nil && !os.IsNotExist(err) {
+		return err
 	}
-
-	listener, err := net.Listen("unix", serverSock)
+	listener, err := net.Listen("unix", p.socket)
 	if err != nil {
-		return fmt.Errorf("failed to listen on %s: %v", serverSock, err)
+		return fmt.Errorf("listen: %w", err)
 	}
-
-	p.server = grpc.NewServer()
+	p.server = grpc.NewServer(grpc.WaitForHandlers(true))
+	server := p.server
 	pluginapi.RegisterDevicePluginServer(p.server, p)
-
+	healthpb.RegisterHealthServer(p.server, p.healthServer)
+	p.healthServer.SetServingStatus("liveness", healthpb.HealthCheckResponse_SERVING)
 	go func() {
-		klog.Infof("Starting gRPC server on %s", serverSock)
-		if err := p.server.Serve(listener); err != nil {
+		if err := server.Serve(listener); err != nil {
 			klog.V(1).Infof("gRPC server stopped: %v", err)
 		}
 	}()
-
-	// Wait for server to start
-	time.Sleep(time.Second)
-
-	// Register with kubelet
-	return p.Register()
+	if err := p.Register(); err != nil {
+		p.Stop()
+		return err
+	}
+	return nil
 }
 
 func (p *HyperlightDevicePlugin) Register() error {
-	conn, err := grpc.Dial(kubeletSock,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 5 * time.Second}
-			return d.DialContext(ctx, "unix", addr)
-		}),
-	)
+	ctx, cancel := context.WithTimeout(context.Background(), p.registrationTimeout)
+	defer cancel()
+	conn, err := dialPlugin(ctx, p.kubeletSocket)
 	if err != nil {
-		return fmt.Errorf("failed to connect to kubelet: %v", err)
+		return fmt.Errorf("connect to kubelet: %w", err)
 	}
 	defer conn.Close()
-
-	client := pluginapi.NewRegistrationClient(conn)
-
-	req := &pluginapi.RegisterRequest{
+	_, err = pluginapi.NewRegistrationClient(conn).Register(ctx, &pluginapi.RegisterRequest{
 		Version:      pluginapi.Version,
-		Endpoint:     filepath.Base(serverSock),
+		Endpoint:     filepath.Base(p.socket),
 		ResourceName: resourceName,
-		Options: &pluginapi.DevicePluginOptions{
-			PreStartRequired:                false,
-			GetPreferredAllocationAvailable: false,
-		},
-	}
-
-	_, err = client.Register(context.Background(), req)
+		Options:      &pluginapi.DevicePluginOptions{},
+	})
 	if err != nil {
-		return fmt.Errorf("failed to register with kubelet: %v", err)
+		return fmt.Errorf("register with kubelet: %w", err)
 	}
-
+	p.mu.Lock()
+	p.registered = true
+	p.updateReadinessLocked()
+	p.mu.Unlock()
 	klog.Infof("Registered with kubelet as %s", resourceName)
 	return nil
 }
 
+func dialPlugin(ctx context.Context, socket string) (*grpc.ClientConn, error) {
+	return grpc.DialContext(ctx, "unix://"+socket,
+		grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
+}
+
 func (p *HyperlightDevicePlugin) Stop() {
-	close(p.stopCh)
+	p.mu.Lock()
+	p.registered = false
+	if p.healthServer != nil {
+		p.healthServer.Shutdown()
+	}
+	select {
+	case <-p.stopCh:
+	default:
+		close(p.stopCh)
+	}
+	p.mu.Unlock()
 	if p.server != nil {
 		p.server.Stop()
 	}
-	os.Remove(serverSock)
+	os.Remove(p.socket)
 	klog.Info("Device plugin stopped")
+}
+
+func (p *HyperlightDevicePlugin) updateReadinessLocked() {
+	if p.healthServer == nil {
+		return
+	}
+	state := healthpb.HealthCheckResponse_NOT_SERVING
+	if p.registered && p.watchers > 0 && p.readinessErr == nil {
+		state = healthpb.HealthCheckResponse_SERVING
+	}
+	p.healthServer.SetServingStatus("", state)
+}
+
+func (p *HyperlightDevicePlugin) checkReadiness(ctx context.Context) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.readinessErr = p.probe(ctx)
+	if p.readinessErr == nil {
+		p.readinessErr = reconcileCDI(p.cdiPath, p.cdiSpec)
+	}
+	p.updateReadinessLocked()
+	return p.readinessErr
+}
+
+// reconcileCDI owns only the configured file; temporary files have no CDI extension.
+func reconcileCDI(path string, desired []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	matches, err := matchesCDI(path, desired)
+	if err != nil {
+		return err
+	}
+	if matches {
+		return nil
+	}
+	temp, err := os.CreateTemp(filepath.Dir(path), ".hyperlight-*.tmp")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(temp.Name())
+	defer temp.Close()
+	if err := temp.Chmod(0644); err != nil {
+		return err
+	}
+	if _, err := temp.Write(desired); err != nil {
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temp.Name(), path); err != nil {
+		return err
+	}
+	matches, err = matchesCDI(path, desired)
+	if err != nil {
+		return err
+	}
+	if !matches {
+		return fmt.Errorf("CDI validation failed after replacement")
+	}
+	klog.Infof("Repaired CDI specification %s", path)
+	return nil
+}
+
+func matchesCDI(path string, desired []byte) (bool, error) {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !info.Mode().IsRegular() {
+		return false, fmt.Errorf("refusing non-regular CDI path %s", path)
+	}
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil {
+		return false, err
+	}
+	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+		return false, fmt.Errorf("CDI file changed during validation")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, int64(len(desired)+1)))
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(data, desired) && info.Mode().Perm() == 0644, nil
 }
 
 // newFSWatcher creates a filesystem watcher for kubelet restart detection.
@@ -339,13 +475,16 @@ func newFSWatcher(files ...string) (*fsnotify.Watcher, error) {
 func (p *HyperlightDevicePlugin) watchKubeletRestart() {
 	klog.Info("Watching for kubelet restart using fsnotify...")
 
-	watcher, err := newFSWatcher(pluginapi.DevicePluginPath)
+	watcher, err := newFSWatcher(filepath.Dir(p.socket))
 	if err != nil {
 		klog.Errorf("Failed to create fsnotify watcher, falling back to polling: %v", err)
 		p.watchKubeletRestartPolling()
 		return
 	}
 	defer watcher.Close()
+	if _, err := os.Stat(p.socket); os.IsNotExist(err) {
+		return
+	}
 
 	for {
 		select {
@@ -357,7 +496,7 @@ func (p *HyperlightDevicePlugin) watchKubeletRestart() {
 				p.watchKubeletRestartPolling()
 				return
 			}
-			if event.Name == serverSock && (event.Op&fsnotify.Remove) == fsnotify.Remove {
+			if event.Name == p.socket && (event.Op&fsnotify.Remove) == fsnotify.Remove {
 				klog.Info("Plugin socket deleted - kubelet may have restarted")
 				return
 			}
@@ -385,7 +524,7 @@ func (p *HyperlightDevicePlugin) watchKubeletRestartPolling() {
 		case <-p.stopCh:
 			return
 		case <-ticker.C:
-			if _, err := os.Stat(serverSock); os.IsNotExist(err) {
+			if _, err := os.Stat(p.socket); os.IsNotExist(err) {
 				klog.Info("Plugin socket deleted - kubelet may have restarted")
 				return
 			}
@@ -395,41 +534,71 @@ func (p *HyperlightDevicePlugin) watchKubeletRestartPolling() {
 
 func main() {
 	klog.InitFlags(nil)
+	healthCheck := flag.String("health-check", "", "check liveness or readiness over the plugin socket")
+	probeHypervisor := flag.String("probe-hypervisor", "", "internal bounded device probe")
+	probePath := flag.String("probe-path", "", "internal device probe path")
 	flag.Parse()
 	defer klog.Flush()
-
-	klog.Info("Starting Hyperlight Device Plugin")
-
+	if *probeHypervisor != "" {
+		if err := checkDevice(*probeHypervisor, *probePath); err != nil {
+			klog.Error(err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *healthCheck != "" {
+		if err := checkHealth(*healthCheck, serverSock); err != nil {
+			klog.Error(err)
+			os.Exit(1)
+		}
+		return
+	}
 	plugin, err := NewHyperlightDevicePlugin()
 	if err != nil {
 		klog.Fatalf("Failed to create device plugin: %v", err)
 	}
-
-	// Handle signals for graceful shutdown
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	// Start plugin with restart handling
-	go func() {
-		for {
-			if err := plugin.Start(); err != nil {
-				klog.Errorf("Failed to start device plugin: %v", err)
-				time.Sleep(5 * time.Second)
-				continue
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+	for ctx.Err() == nil {
+		if err := plugin.Start(); err != nil {
+			klog.Errorf("Failed to start device plugin: %v", err)
+		} else {
+			done := make(chan struct{})
+			go func() { plugin.watchKubeletRestart(); close(done) }()
+			select {
+			case <-ctx.Done():
+			case <-done:
 			}
-
-			// Watch for kubelet restart (socket deletion)
-			// When kubelet restarts, it deletes all sockets in /var/lib/kubelet/device-plugins/
-			plugin.watchKubeletRestart()
-
-			// If we get here, kubelet restarted - stop current server and re-register
-			klog.Info("Detected kubelet restart, re-registering...")
-			plugin.server.Stop()
-			time.Sleep(time.Second) // Brief pause before restart
+			plugin.Stop()
+			<-done
 		}
-	}()
+		select {
+		case <-ctx.Done():
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
 
-	sig := <-sigCh
-	klog.Infof("Received signal %v, shutting down", sig)
-	plugin.Stop()
+func checkHealth(service, socket string) error {
+	if service != "liveness" && service != "readiness" {
+		return fmt.Errorf("unknown health service %q", service)
+	}
+	if service == "readiness" {
+		service = ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	conn, err := dialPlugin(ctx, socket)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	response, err := healthpb.NewHealthClient(conn).Check(ctx, &healthpb.HealthCheckRequest{Service: service})
+	if err != nil {
+		return err
+	}
+	if response.Status != healthpb.HealthCheckResponse_SERVING {
+		return fmt.Errorf("plugin is not serving %s", service)
+	}
+	return nil
 }

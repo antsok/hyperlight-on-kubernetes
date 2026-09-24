@@ -90,11 +90,17 @@ spec:
           livenessProbe:
             exec:
               command:
-                - test
-                - -S
-                - /var/lib/kubelet/device-plugins/hyperlight.sock
+                - hyperlight-device-plugin
+                - --health-check=liveness
             initialDelaySeconds: 10
             periodSeconds: 30
+            timeoutSeconds: 5
+          readinessProbe:
+            exec:
+              command:
+                - hyperlight-device-plugin
+                - --health-check=readiness
+            periodSeconds: 10
             timeoutSeconds: 5
       volumes:
         - name: device-plugin
