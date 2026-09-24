@@ -156,7 +156,11 @@ func newDevicePluginWithDevice(hypervisor, devicePath string, deviceAccess bool)
 		return p, nil
 	}
 	p.cdiSpec = desiredCDISpec(hypervisor, devicePath)
-	probe := &deviceProbe{}
+	hostPath := devicePath
+	if dir := os.Getenv("HOST_DEVICE_DIR"); dir != "" {
+		hostPath = filepath.Join(dir, filepath.Base(devicePath))
+	}
+	probe := &deviceProbe{hostPath: hostPath}
 	p.probe = func(ctx context.Context) error { return probe.check(ctx, hypervisor, devicePath) }
 	return p, nil
 }
@@ -642,10 +646,11 @@ func main() {
 	healthCheck := flag.String("health-check", "", "check liveness or readiness over the plugin socket")
 	probeHypervisor := flag.String("probe-hypervisor", "", "internal bounded device probe")
 	probePath := flag.String("probe-path", "", "internal device probe path")
+	probeHostPath := flag.String("probe-host-path", "", "internal host device identity path")
 	flag.Parse()
 	defer klog.Flush()
 	if *probeHypervisor != "" {
-		if err := checkDevice(*probeHypervisor, *probePath); err != nil {
+		if err := checkDeviceWithHost(*probeHypervisor, *probePath, *probeHostPath); err != nil {
 			klog.Error(err)
 			os.Exit(1)
 		}

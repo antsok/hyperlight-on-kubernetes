@@ -30,7 +30,11 @@ func TestMain(m *testing.M) {
 		if os.Getenv("TEST_PROBE_HANG") == "1" {
 			time.Sleep(time.Minute)
 		}
-		err := checkDevice(strings.TrimPrefix(os.Args[1], "--probe-hypervisor="), strings.TrimPrefix(os.Args[2], "--probe-path="))
+		hostPath := ""
+		if len(os.Args) > 3 {
+			hostPath = strings.TrimPrefix(os.Args[3], "--probe-host-path=")
+		}
+		err := checkDeviceWithHost(strings.TrimPrefix(os.Args[1], "--probe-hypervisor="), strings.TrimPrefix(os.Args[2], "--probe-path="), hostPath)
 		if err != nil {
 			os.Exit(1)
 		}

@@ -71,6 +71,8 @@ spec:
           # KIND workaround: move termination log out of /dev
           terminationMessagePath: /tmp/termination-log
           env:
+            - name: HOST_DEVICE_DIR
+              value: /host-dev
             # Number of concurrent hypervisor allocations per node.
             # This is NOT physical devices - the hypervisor device is shared.
             # Each allocation grants access to /dev/kvm or /dev/mshv.
@@ -88,6 +90,9 @@ spec:
             allowPrivilegeEscalation: false
             runAsUser: 0  # Required: write access to /var/run/cdi and /var/lib/kubelet/device-plugins
           volumeMounts:
+            - name: host-dev
+              mountPath: /host-dev
+              readOnly: true
             # Kubelet device plugin socket directory
             - name: device-plugin
               mountPath: /var/lib/kubelet/device-plugins
@@ -119,6 +124,10 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 5
       volumes:
+        - name: host-dev
+          hostPath:
+            path: /dev
+            type: Directory
         - name: device-plugin
           hostPath:
             path: /var/lib/kubelet/device-plugins

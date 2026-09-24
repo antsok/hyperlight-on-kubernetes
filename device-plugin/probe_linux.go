@@ -15,28 +15,29 @@ import (
 
 // Keep at most one helper alive if a kernel operation cannot be interrupted.
 type deviceProbe struct {
-	mu      sync.Mutex
-	pending chan error
+	mu       sync.Mutex
+	pending  chan error
+	hostPath string
 }
 
 func (p *deviceProbe) check(ctx context.Context, hypervisor, path string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
 	if p.pending != nil {
 		select {
 		case <-p.pending:
 			p.pending = nil
-		default:
-			return fmt.Errorf("previous device probe has not exited")
+		case <-ctx.Done():
+			return fmt.Errorf("previous device probe has not exited: %w", ctx.Err())
 		}
 	}
 	executable, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, executable, "--probe-hypervisor="+hypervisor, "--probe-path="+path)
+	cmd := exec.CommandContext(ctx, executable, "--probe-hypervisor="+hypervisor, "--probe-path="+path, "--probe-host-path="+p.hostPath)
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		return err
@@ -70,12 +71,28 @@ func checkDeviceNode(path string) error {
 
 // checkDevice never changes host device ownership, permissions or existing VMs.
 func checkDevice(hypervisor, path string) error {
+	return checkDeviceWithHost(hypervisor, path, path)
+}
+
+func checkDeviceWithHost(hypervisor, path, hostPath string) error {
 	info, err := os.Lstat(path)
 	if err != nil {
 		return err
 	}
 	if info.Mode()&os.ModeCharDevice == 0 {
 		return fmt.Errorf("%s is not a character device", path)
+	}
+	if hostPath == "" {
+		hostPath = path
+	}
+	hostInfo, err := os.Lstat(hostPath)
+	if err != nil {
+		return fmt.Errorf("host hypervisor device: %w", err)
+	}
+	injected, injectedOK := info.Sys().(*syscall.Stat_t)
+	host, hostOK := hostInfo.Sys().(*syscall.Stat_t)
+	if !injectedOK || !hostOK || hostInfo.Mode()&os.ModeCharDevice == 0 || host.Rdev != injected.Rdev {
+		return fmt.Errorf("host hypervisor device does not match injected device")
 	}
 	fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {

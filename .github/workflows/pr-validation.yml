@@ -79,6 +79,7 @@ jobs:
           cache-dependency-path: device-plugin/go.sum
 
       - name: Check KVM
+        id: kvm-snapshot
         run: |
           test -c /dev/kvm
           stat -c '%a:%u:%g:%t:%T' /dev/kvm > "$RUNNER_TEMP/kvm-before"
@@ -182,3 +183,9 @@ jobs:
         if: always()
         run: |
           just local-down || true
+
+      - name: Verify host KVM metadata is unchanged
+        if: always() && steps.kvm-snapshot.outcome == 'success'
+        run: |
+          stat -c '%a:%u:%g:%t:%T' /dev/kvm > "$RUNNER_TEMP/kvm-after"
+          cmp "$RUNNER_TEMP/kvm-before" "$RUNNER_TEMP/kvm-after"
