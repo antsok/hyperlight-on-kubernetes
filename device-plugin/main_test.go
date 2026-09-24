@@ -43,6 +43,13 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+func requireNoError(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func testPlugin(t *testing.T) *HyperlightDevicePlugin {
 	t.Helper()
 	dir := t.TempDir()
@@ -77,34 +84,22 @@ func TestCDIRepair(t *testing.T) {
 			dir := t.TempDir()
 			path := filepath.Join(dir, "hyperlight.json")
 			unrelated := filepath.Join(dir, "other.json")
-			if err := os.WriteFile(unrelated, []byte("leave me"), 0600); err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, os.WriteFile(unrelated, []byte("leave me"), 0600))
 			if initial != nil {
-				if err := os.WriteFile(path, initial, 0600); err != nil {
-					t.Fatal(err)
-				}
+				requireNoError(t, os.WriteFile(path, initial, 0600))
 			}
-			if err := reconcileCDI(path, expected); err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, reconcileCDI(path, expected))
 			actual, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			if !bytes.Equal(actual, expected) {
 				t.Fatalf("unexpected spec: %s", actual)
 			}
 			info, err := os.Stat(path)
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			if info.Mode().Perm() != 0644 {
 				t.Fatalf("mode: %v", info.Mode())
 			}
-			if err := reconcileCDI(path, expected); err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, reconcileCDI(path, expected))
 			after, _ := os.Stat(path)
 			if !os.SameFile(info, after) {
 				t.Fatal("valid file replaced")
@@ -127,18 +122,14 @@ func TestCDIRefusesNonRegularPaths(t *testing.T) {
 			dir := t.TempDir()
 			path := filepath.Join(dir, "hyperlight.json")
 			target := filepath.Join(dir, "target")
-			if err := os.WriteFile(target, []byte("untouched"), 0600); err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, os.WriteFile(target, []byte("untouched"), 0600))
 			var err error
 			if kind == "symlink" {
 				err = os.Symlink(target, path)
 			} else {
 				err = os.Mkdir(path, 0755)
 			}
-			if err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, err)
 			if err := reconcileCDI(path, desiredCDISpec("kvm", "/dev/kvm")); err == nil {
 				t.Fatal("expected refusal")
 			}
@@ -154,9 +145,7 @@ func TestCDIAtomicReplacement(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hyperlight.json")
 	first := desiredCDISpec("kvm", "/dev/kvm")
 	second := desiredCDISpec("mshv", "/dev/mshv")
-	if err := reconcileCDI(path, first); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, reconcileCDI(path, first))
 	done := make(chan struct{})
 	result := make(chan error, 1)
 	go func() {
@@ -189,9 +178,7 @@ func TestCDIAtomicReplacement(t *testing.T) {
 		}
 	}
 	close(done)
-	if err := <-result; err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, <-result)
 }
 
 type watchStream struct {
@@ -209,6 +196,23 @@ func (s *watchStream) Send(r *pluginapi.ListAndWatchResponse) error {
 		return s.ctx.Err()
 	}
 }
+func watchDevices(t *testing.T, p *HyperlightDevicePlugin) *watchStream {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	stream := &watchStream{ctx: ctx, updates: make(chan *pluginapi.ListAndWatchResponse, 8)}
+	done := make(chan error, 1)
+	go func() { done <- p.ListAndWatch(&pluginapi.Empty{}, stream) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Error("health stream did not stop")
+		}
+	})
+	return stream
+}
+
 func expectHealth(t *testing.T, s *watchStream, want string) {
 	t.Helper()
 	select {
@@ -230,21 +234,13 @@ func TestAllocationAndWatchRecover(t *testing.T) {
 		}
 		return nil
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	stream := &watchStream{ctx: ctx, updates: make(chan *pluginapi.ListAndWatchResponse, 8)}
-	done := make(chan error, 1)
-	go func() { done <- p.ListAndWatch(&pluginapi.Empty{}, stream) }()
-	defer func() { cancel(); <-done }()
+	stream := watchDevices(t, p)
+	ctx := stream.Context()
 	expectHealth(t, stream, pluginapi.Healthy)
 	req := &pluginapi.AllocateRequest{ContainerRequests: []*pluginapi.ContainerAllocateRequest{{DevicesIds: []string{"kvm-0"}}}}
-	if err := os.Remove(p.cdiPath); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.Remove(p.cdiPath))
 	response, err := p.Allocate(ctx, req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if response.ContainerResponses[0].CdiDevices[0].Name != "hyperlight.dev/hypervisor=kvm" {
 		t.Fatal(response)
 	}
@@ -260,20 +256,14 @@ func TestAllocationAndWatchRecover(t *testing.T) {
 	expectHealth(t, stream, pluginapi.Healthy)
 	// An unrecoverable owned path blocks both new allocation and health advertisement.
 	p.checkGate <- struct{}{}
-	if err := os.Remove(p.cdiPath); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(p.cdiPath, 0755); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.Remove(p.cdiPath))
+	requireNoError(t, os.Mkdir(p.cdiPath, 0755))
 	<-p.checkGate
 	if _, err := p.Allocate(ctx, req); status.Code(err) != codes.Unavailable {
 		t.Fatalf("repair failure ignored: %v", err)
 	}
 	expectHealth(t, stream, pluginapi.Unhealthy)
-	if err := os.Remove(p.cdiPath); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.Remove(p.cdiPath))
 	expectHealth(t, stream, pluginapi.Healthy)
 	req.ContainerRequests[0].DevicesIds = []string{"unknown"}
 	if _, err := p.Allocate(ctx, req); status.Code(err) != codes.InvalidArgument {
@@ -302,18 +292,21 @@ func (s *registrationServer) Register(ctx context.Context, r *pluginapi.Register
 	return &pluginapi.Empty{}, nil
 }
 
-func TestRegistrationFailureAndRecovery(t *testing.T) {
-	p := testPlugin(t)
+func serveRegistration(t *testing.T, p *HyperlightDevicePlugin, registration *registrationServer) {
+	t.Helper()
 	listener, err := net.Listen("unix", p.kubeletSocket)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	server := grpc.NewServer()
-	registration := &registrationServer{}
-	registration.blocked.Store(true)
 	pluginapi.RegisterRegistrationServer(server, registration)
 	go server.Serve(listener)
-	defer server.Stop()
+	t.Cleanup(server.Stop)
+}
+
+func TestRegistrationFailureAndRecovery(t *testing.T) {
+	p := testPlugin(t)
+	registration := &registrationServer{}
+	registration.blocked.Store(true)
+	serveRegistration(t, p, registration)
 	if err := p.Start(); err == nil {
 		t.Fatal("stalled registration succeeded")
 	}
@@ -321,37 +314,25 @@ func TestRegistrationFailureAndRecovery(t *testing.T) {
 		t.Fatalf("failed start leaked socket: %v", err)
 	}
 	registration.blocked.Store(false)
-	if err := p.Start(); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, p.Start())
 	defer p.Stop()
-	if err := checkHealth("liveness", p.socket); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, checkHealth("liveness", p.socket))
 	if err := checkHealth("readiness", p.socket); err == nil {
 		t.Fatal("registration alone marked ready")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	conn, err := dialPlugin(ctx, p.socket)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer conn.Close()
 	watch, err := pluginapi.NewDevicePluginClient(conn).ListAndWatch(ctx, &pluginapi.Empty{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if _, err := watch.Recv(); err != nil {
 		t.Fatal(err)
 	}
-	if err := checkHealth("readiness", p.socket); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, checkHealth("readiness", p.socket))
 	// Recreate the server after kubelet removes the plugin socket.
-	if err := os.Remove(p.socket); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.Remove(p.socket))
 	returned := make(chan struct{})
 	go func() { p.watchKubeletRestart(); close(returned) }()
 	select {
@@ -362,9 +343,7 @@ func TestRegistrationFailureAndRecovery(t *testing.T) {
 	cancel()
 	conn.Close()
 	p.Stop()
-	if err := p.Start(); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, p.Start())
 	if err := checkHealth("readiness", p.socket); err == nil {
 		t.Fatal("old registration/stream marked restarted server ready")
 	}
@@ -373,9 +352,7 @@ func TestRegistrationFailureAndRecovery(t *testing.T) {
 func TestReadinessRequiresRegistration(t *testing.T) {
 	p := testPlugin(t)
 	p.watchers = 1
-	if err := p.checkReadiness(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, p.checkReadiness(context.Background()))
 	response, err := p.healthServer.Check(context.Background(), &healthpb.HealthCheckRequest{})
 	if err != nil || response.Status != healthpb.HealthCheckResponse_NOT_SERVING {
 		t.Fatalf("unregistered readiness: %v %v", response, err)
@@ -384,9 +361,7 @@ func TestReadinessRequiresRegistration(t *testing.T) {
 
 func TestDeviceProbeRejectsUnusableDevices(t *testing.T) {
 	regular := filepath.Join(t.TempDir(), "kvm")
-	if err := os.WriteFile(regular, nil, 0600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(regular, nil, 0600))
 	for _, path := range []string{regular, regular + "-missing", "/dev/null"} {
 		if err := checkDevice("kvm", path); err == nil {
 			t.Fatalf("accepted %s", path)
@@ -430,20 +405,14 @@ func TestCDIUnwritableDirectoryRecovers(t *testing.T) {
 	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "hyperlight.json")
-	if err := os.Chmod(dir, 0555); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.Chmod(dir, 0555))
 	defer os.Chmod(dir, 0755)
 	expected := desiredCDISpec("kvm", "/dev/kvm")
 	if err := reconcileCDI(path, expected); err == nil {
 		t.Fatal("repair succeeded in unwritable directory")
 	}
-	if err := os.Chmod(dir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := reconcileCDI(path, expected); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.Chmod(dir, 0755))
+	requireNoError(t, reconcileCDI(path, expected))
 }
 
 func TestAllocationHealthChangesWakeEveryWatcher(t *testing.T) {
@@ -456,15 +425,11 @@ func TestAllocationHealthChangesWakeEveryWatcher(t *testing.T) {
 		}
 		return nil
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	streams := []*watchStream{{ctx: ctx, updates: make(chan *pluginapi.ListAndWatchResponse, 8)}, {ctx: ctx, updates: make(chan *pluginapi.ListAndWatchResponse, 8)}}
-	done := make(chan error, 2)
+	streams := []*watchStream{watchDevices(t, p), watchDevices(t, p)}
+	ctx := streams[0].Context()
 	for _, stream := range streams {
-		go func() { done <- p.ListAndWatch(&pluginapi.Empty{}, stream) }()
 		expectHealth(t, stream, pluginapi.Healthy)
 	}
-	defer func() { cancel(); <-done; <-done }()
 	req := &pluginapi.AllocateRequest{ContainerRequests: []*pluginapi.ContainerAllocateRequest{{DevicesIds: []string{"kvm-0"}}}}
 	unusable.Store(true)
 	if _, err := p.Allocate(ctx, req); status.Code(err) != codes.Unavailable {
@@ -524,9 +489,7 @@ func TestCancelledChecksPreserveSharedReadiness(t *testing.T) {
 
 func TestCancellationDuringProbePreservesReadiness(t *testing.T) {
 	p := testPlugin(t)
-	if err := p.checkReadiness(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, p.checkReadiness(context.Background()))
 	entered := make(chan struct{})
 	p.probe = func(ctx context.Context) error { close(entered); <-ctx.Done(); return ctx.Err() }
 	ctx, cancel := context.WithCancel(context.Background())
@@ -563,9 +526,7 @@ func TestCancelledCheckDoesNotWaitForActiveProbe(t *testing.T) {
 		t.Error("cancelled check waited for active probe")
 	}
 	close(release)
-	if err := <-first; err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, <-first)
 }
 
 func TestProbeDeadlineRemainsDeviceFailure(t *testing.T) {
@@ -583,9 +544,7 @@ func TestCDIOwnershipValuesFitRuntimeSchema(t *testing.T) {
 			t.Setenv("DEVICE_UID", value)
 			t.Setenv("DEVICE_GID", value)
 			p := testPlugin(t)
-			if err := p.checkReadiness(context.Background()); err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, p.checkReadiness(context.Background()))
 			var spec struct {
 				Devices []struct {
 					ContainerEdits struct {
@@ -596,9 +555,7 @@ func TestCDIOwnershipValuesFitRuntimeSchema(t *testing.T) {
 					}
 				}
 			}
-			if err := json.Unmarshal(p.cdiSpec, &spec); err != nil {
-				t.Fatal(err)
-			}
+			requireNoError(t, json.Unmarshal(p.cdiSpec, &spec))
 			node := spec.Devices[0].ContainerEdits.DeviceNodes[0]
 			expected := uint32(65534)
 			switch value {
@@ -617,18 +574,14 @@ func TestCDIOwnershipValuesFitRuntimeSchema(t *testing.T) {
 func TestBootstrapGrantNeedsNoHypervisorOpenOrCDI(t *testing.T) {
 	t.Setenv("DEVICE_COUNT", "2000")
 	p, err := newDevicePluginWithDevice("kvm", "/dev/null", true)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if len(p.devices) != 1 || p.registrationResource() != deviceAccessResource || p.socket != deviceAccessSock {
 		t.Fatal("bootstrap registration is not isolated")
 	}
 	p.cdiPath = filepath.Join(t.TempDir(), "must-not-create.json")
 	req := &pluginapi.AllocateRequest{ContainerRequests: []*pluginapi.ContainerAllocateRequest{{DevicesIds: []string{"kvm-0"}}}}
 	response, err := p.Allocate(context.Background(), req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	allocated := response.ContainerResponses[0]
 	if len(allocated.CdiDevices) != 0 || len(allocated.Devices) != 1 || len(allocated.Mounts) != 0 || len(allocated.Envs) != 0 {
 		t.Fatalf("unexpected bootstrap grant: %v", allocated)
@@ -651,22 +604,14 @@ func TestBootstrapGrantNeedsNoHypervisorOpenOrCDI(t *testing.T) {
 
 func TestBootstrapRefusesNonDevicePaths(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "device")
-	if err := os.WriteFile(path, nil, 0600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(path, nil, 0600))
 	p, err := newDevicePluginWithDevice("kvm", path, true)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if _, err := p.Allocate(context.Background(), &pluginapi.AllocateRequest{}); status.Code(err) != codes.Unavailable {
 		t.Fatal("bootstrap accepted regular file")
 	}
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink("/dev/null", path); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.Remove(path))
+	requireNoError(t, os.Symlink("/dev/null", path))
 	if _, err := p.Allocate(context.Background(), &pluginapi.AllocateRequest{}); status.Code(err) != codes.Unavailable {
 		t.Fatal("bootstrap accepted symlink")
 	}
@@ -674,50 +619,29 @@ func TestBootstrapRefusesNonDevicePaths(t *testing.T) {
 
 func TestBootstrapRegistersAndAllocatesOverGRPC(t *testing.T) {
 	p, err := newDevicePluginWithDevice("kvm", "/dev/null", true)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	dir := t.TempDir()
 	p.socket = filepath.Join(dir, "access.sock")
 	p.kubeletSocket = filepath.Join(dir, "kubelet.sock")
-	listener, err := net.Listen("unix", p.kubeletSocket)
-	if err != nil {
-		t.Fatal(err)
-	}
-	registration := grpc.NewServer()
-	pluginapi.RegisterRegistrationServer(registration, &registrationServer{expectedResource: deviceAccessResource})
-	go registration.Serve(listener)
-	defer registration.Stop()
-	if err := p.Start(); err != nil {
-		t.Fatal(err)
-	}
+	serveRegistration(t, p, &registrationServer{expectedResource: deviceAccessResource})
+	requireNoError(t, p.Start())
 	defer p.Stop()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	conn, err := dialPlugin(ctx, p.socket)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	defer conn.Close()
 	client := pluginapi.NewDevicePluginClient(conn)
 	watch, err := client.ListAndWatch(ctx, &pluginapi.Empty{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	update, err := watch.Recv()
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if len(update.Devices) != 1 || update.Devices[0].Health != pluginapi.Healthy {
 		t.Fatal(update)
 	}
-	if err := checkHealth("readiness", p.socket); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, checkHealth("readiness", p.socket))
 	response, err := client.Allocate(ctx, &pluginapi.AllocateRequest{ContainerRequests: []*pluginapi.ContainerAllocateRequest{{DevicesIds: []string{update.Devices[0].ID}}}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	if len(response.ContainerResponses[0].Devices) != 1 || len(response.ContainerResponses[0].CdiDevices) != 0 {
 		t.Fatal(response)
 	}

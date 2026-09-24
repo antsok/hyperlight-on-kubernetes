@@ -18,59 +18,35 @@ import (
 
 func TestHostDeviceLossBlocksAllocationAndRecovers(t *testing.T) {
 	hostDir := filepath.Join(t.TempDir(), "devices")
-	if err := os.Symlink("/dev", hostDir); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.Symlink("/dev", hostDir))
 	t.Setenv("HOST_DEVICE_DIR", hostDir)
 	p, err := newDevicePluginWithDevice("mshv", "/dev/null", false)
-	if err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, err)
 	p.cdiPath = filepath.Join(t.TempDir(), "hyperlight.json")
 	p.interval = time.Hour
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	stream := &watchStream{ctx: ctx, updates: make(chan *pluginapi.ListAndWatchResponse, 8)}
-	done := make(chan error, 1)
-	go func() { done <- p.ListAndWatch(&pluginapi.Empty{}, stream) }()
-	defer func() { cancel(); <-done }()
+	stream := watchDevices(t, p)
+	ctx := stream.Context()
 	expectHealth(t, stream, pluginapi.Healthy)
-	if err := os.Remove(hostDir); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.Remove(hostDir))
 	req := &pluginapi.AllocateRequest{ContainerRequests: []*pluginapi.ContainerAllocateRequest{{DevicesIds: []string{"mshv-0"}}}}
 	if _, err := p.Allocate(ctx, req); status.Code(err) != codes.Unavailable {
 		t.Fatalf("missing host device allowed allocation: %v", err)
 	}
 	expectHealth(t, stream, pluginapi.Unhealthy)
-	if err := os.Mkdir(hostDir, 0755); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.Mkdir(hostDir, 0755))
 	hostPath := filepath.Join(hostDir, "null")
-	if err := os.WriteFile(hostPath, nil, 0600); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.WriteFile(hostPath, nil, 0600))
 	if _, err := p.Allocate(ctx, req); status.Code(err) != codes.Unavailable {
 		t.Fatalf("regular host path allowed: %v", err)
 	}
-	if err := os.Remove(hostPath); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink("/dev/null", hostPath); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.Remove(hostPath))
+	requireNoError(t, os.Symlink("/dev/null", hostPath))
 	if _, err := p.Allocate(ctx, req); status.Code(err) != codes.Unavailable {
 		t.Fatalf("host device symlink allowed: %v", err)
 	}
-	if err := os.Remove(hostPath); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(hostDir); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink("/dev", hostDir); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, os.Remove(hostPath))
+	requireNoError(t, os.Remove(hostDir))
+	requireNoError(t, os.Symlink("/dev", hostDir))
 	if _, err := p.Allocate(ctx, req); err != nil {
 		t.Fatalf("restored host device refused: %v", err)
 	}
@@ -80,9 +56,7 @@ func TestHostDeviceLossBlocksAllocationAndRecovers(t *testing.T) {
 func TestCancelledHelperDoesNotPoisonNextCheck(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		p := testPlugin(t)
-		if err := p.checkReadiness(context.Background()); err != nil {
-			t.Fatal(err)
-		}
+		requireNoError(t, p.checkReadiness(context.Background()))
 		probe := &deviceProbe{}
 		p.probe = func(ctx context.Context) error { return probe.check(ctx, "mshv", "/dev/null") }
 		t.Setenv("TEST_PROBE_HANG", "1")
@@ -106,16 +80,12 @@ func TestHostDeviceIdentityMustMatch(t *testing.T) {
 	if err := checkDeviceWithHost("mshv", "/dev/null", "/dev/zero"); err == nil {
 		t.Fatal("different host device number accepted")
 	}
-	if err := checkDeviceWithHost("mshv", "/dev/null", "/dev/null"); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, checkDeviceWithHost("mshv", "/dev/null", "/dev/null"))
 }
 
 func TestCancellationWhileReapingPreservesHealth(t *testing.T) {
 	p := testPlugin(t)
-	if err := p.checkReadiness(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	requireNoError(t, p.checkReadiness(context.Background()))
 	pending := make(chan error, 1)
 	probe := &deviceProbe{pending: pending}
 	p.probe = func(ctx context.Context) error { return probe.check(ctx, "mshv", "/dev/null") }
