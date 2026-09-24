@@ -6,9 +6,10 @@ How the Hyperlight Device Plugin works.
 
 The device plugin enables Hyperlight sandboxes to run in Kubernetes **without privileged containers** by:
 
-1. Detecting available hypervisor devices (`/dev/kvm` or `/dev/mshv`)
-2. Registering them as schedulable resources with kubelet
-3. Using CDI to inject devices into containers at runtime
+1. Granting the trusted plugin one hypervisor device through the bootstrap device-access DaemonSet
+2. Detecting and validating the injected hypervisor device (`/dev/kvm` or `/dev/mshv`)
+3. Registering them as schedulable resources with kubelet
+4. Using CDI to inject devices into containers at runtime
 
 ```mermaid
 flowchart LR
@@ -27,6 +28,14 @@ flowchart LR
     end
 ```
 
+## Bootstrap device access
+
+The manifest deploys two DaemonSets from the same image. `hyperlight-device-access` runs `--device-access` and inventories the existing character device without opening it. It registers exactly one `hyperlight.dev/device-access` allocation per node through a separate kubelet socket. Its Allocate response contains only a read/write `DeviceSpec` for the detected hypervisor path; it does not write CDI, grant other devices, or claim VM usability.
+
+The main `hyperlight-device-plugin` DaemonSet requests that allocation. Kubelet passes the device to the runtime, which grants the corresponding device-cgroup access before starting the main plugin. The main container has no host `/dev` directory mount and performs the real KVM check. The bootstrap pod has no dependency on the main resource, so it can start on a fresh node. Both containers remain non-privileged; neither changes host device ownership or permissions. Reserve `hyperlight.dev/device-access` for this trusted infrastructure in the cluster's admission or quota policy. Application pods continue to request `hyperlight.dev/hypervisor`.
+
+The extra DaemonSet adds one small infrastructure container per enabled node. Its advertised allocation is a device-access grant, not a promise of hypervisor health. The main plugin remains responsible for workload health, CDI repair and usable allocation. Delete both DaemonSets when uninstalling the manifest; do not remove unrelated CDI files or kubelet sockets.
+
 ## Device Plugin API
 
 The plugin implements the Kubernetes Device Plugin API:
@@ -42,7 +51,7 @@ On startup, the plugin:
 
 Reports device health to kubelet:
 - Validates device usability and the plugin-owned CDI specification before sending the initial device list.
-- Repeats validation every 30 seconds; failed validation marks every allocation unhealthy.
+- Repeats validation every 30 seconds; failed validation marks every allocation unhealthy. Checks completed during Allocate also wake all active health streams immediately.
 - Repairs missing, malformed or stale CDI and restores healthy advertisement after validation succeeds. Kubelet updates allocatable resources accordingly.
 
 ### Allocate
@@ -93,9 +102,11 @@ The plugin owns only `/var/run/cdi/hyperlight.json`. Its exact configured specif
 
 For KVM, a helper opens the character device read/write, verifies API version 12, creates an empty VM and closes it without allocating guest memory or vCPUs. See the [Linux KVM API](https://docs.kernel.org/virt/kvm/api.html). Each helper has a two-second deadline. If a kernel operation prevents it from exiting, the plugin refuses further probes until that helper is reaped rather than accumulating processes. MSHV currently receives a character-device/open check only; this does not establish successful MSHV VM creation.
 
-The trusted plugin must itself be permitted to open the hypervisor by host permissions, its device cgroup and its security policy. A host `/dev` directory mount alone does not grant device-cgroup access. Denial fails readiness; the plugin does not change permissions or elevate itself. Verify this access on the intended runtime before deploying this version. The probe establishes usability for the plugin, not admission or device access for every application security context; fresh guest execution remains a separate acceptance check.
+The bootstrap allocation gives the trusted plugin explicit hypervisor device access through kubelet and the container runtime. Host permissions and security policy still apply; denial fails readiness without changing those policies. The probe establishes usability for the plugin, not admission or device access for every application security context; fresh guest execution remains a separate acceptance check.
 
 The liveness probe performs a gRPC health request to the running server. Readiness additionally requires a successful, deadline-bounded kubelet registration, an active `ListAndWatch` stream and a successful readiness check. Socket existence alone satisfies neither probe. Registration failures stop the attempted server before retrying; kubelet socket cleanup causes the server to be recreated and registered again.
+
+Cancelled allocation requests do not replace shared health observations. Waiting for an active check respects the caller deadline; a timeout of the internal device probe remains a device-health failure. UID/GID configuration is parsed as unsigned 32-bit values, matching CDI; invalid values retain the default ownership.
 
 Offline regression checks run with `cd device-plugin && go test -race -count=1 -timeout=90s ./...`. Live acceptance must separately verify existing guests and fresh allocations while removing or corrupting only the owned CDI file, making its storage temporarily unwritable, denying device access, and restarting kubelet. Restore the exact original state and verify recovery and application-owner cleanup. These tests do not establish production capacity or node fencing.
 

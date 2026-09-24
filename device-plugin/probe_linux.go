@@ -56,6 +56,18 @@ func (p *deviceProbe) check(ctx context.Context, hypervisor, path string) error 
 	}
 }
 
+// checkDeviceNode inventories a device for the bootstrap grant without opening it.
+func checkDeviceNode(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeCharDevice == 0 {
+		return fmt.Errorf("%s is not a character device", path)
+	}
+	return nil
+}
+
 // checkDevice never changes host device ownership, permissions or existing VMs.
 func checkDevice(hypervisor, path string) error {
 	info, err := os.Lstat(path)

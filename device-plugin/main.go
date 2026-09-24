@@ -43,19 +43,24 @@ import (
 )
 
 const (
-	resourceName       = "hyperlight.dev/hypervisor"
-	serverSock         = pluginapi.DevicePluginPath + "hyperlight.sock"
-	kubeletSock        = pluginapi.KubeletSocket
-	cdiSpecPath        = "/var/run/cdi/hyperlight.json"
-	defaultDeviceCount = 2000  // Conservative default for MSHV; KVM can handle more
-	defaultDeviceUID   = 65534 // Default UID for device node in container (nobody)
-	defaultDeviceGID   = 65534 // Default GID for device node in container (nobody)
+	resourceName         = "hyperlight.dev/hypervisor"
+	deviceAccessResource = "hyperlight.dev/device-access"
+	deviceAccessSock     = pluginapi.DevicePluginPath + "hyperlight-access.sock"
+	serverSock           = pluginapi.DevicePluginPath + "hyperlight.sock"
+	kubeletSock          = pluginapi.KubeletSocket
+	cdiSpecPath          = "/var/run/cdi/hyperlight.json"
+	defaultDeviceCount   = 2000  // Conservative default for MSHV; KVM can handle more
+	defaultDeviceUID     = 65534 // Default UID for device node in container (nobody)
+	defaultDeviceGID     = 65534 // Default GID for device node in container (nobody)
 )
 
 type HyperlightDevicePlugin struct {
 	devices             []*pluginapi.Device
 	server              *grpc.Server
 	hypervisor          string
+	devicePath          string
+	resource            string
+	deviceAccess        bool
 	stopCh              chan struct{}
 	mu                  sync.Mutex
 	cdiPath             string
@@ -65,6 +70,9 @@ type HyperlightDevicePlugin struct {
 	registered          bool
 	watchers            int
 	readinessErr        error
+	readinessKnown      bool
+	checkGate           chan struct{}
+	changed             chan struct{}
 	socket              string
 	kubeletSocket       string
 	interval            time.Duration
@@ -73,6 +81,10 @@ type HyperlightDevicePlugin struct {
 }
 
 func NewHyperlightDevicePlugin() (*HyperlightDevicePlugin, error) {
+	return newDevicePlugin(false)
+}
+
+func newDevicePlugin(deviceAccess bool) (*HyperlightDevicePlugin, error) {
 	var devicePath, hypervisor string
 
 	// Auto-detect hypervisor - prefer MSHV over KVM
@@ -86,6 +98,10 @@ func NewHyperlightDevicePlugin() (*HyperlightDevicePlugin, error) {
 		return nil, fmt.Errorf("no supported hypervisor found (/dev/kvm or /dev/mshv)")
 	}
 
+	return newDevicePluginWithDevice(hypervisor, devicePath, deviceAccess)
+}
+
+func newDevicePluginWithDevice(hypervisor, devicePath string, deviceAccess bool) (*HyperlightDevicePlugin, error) {
 	klog.Infof("Detected hypervisor: %s at %s", hypervisor, devicePath)
 
 	// Get device count from environment, default to 2000
@@ -103,6 +119,9 @@ func NewHyperlightDevicePlugin() (*HyperlightDevicePlugin, error) {
 		}
 	}
 
+	if deviceAccess {
+		numDevices = 1
+	}
 	devices := make([]*pluginapi.Device, numDevices)
 	for i := 0; i < numDevices; i++ {
 		devices[i] = &pluginapi.Device{
@@ -115,14 +134,28 @@ func NewHyperlightDevicePlugin() (*HyperlightDevicePlugin, error) {
 	p := &HyperlightDevicePlugin{
 		devices:             devices,
 		hypervisor:          hypervisor,
+		devicePath:          devicePath,
+		resource:            resourceName,
+		deviceAccess:        deviceAccess,
 		stopCh:              make(chan struct{}),
 		cdiPath:             cdiSpecPath,
-		cdiSpec:             desiredCDISpec(hypervisor, devicePath),
 		socket:              serverSock,
 		kubeletSocket:       kubeletSock,
 		interval:            30 * time.Second,
 		registrationTimeout: 5 * time.Second,
 	}
+	if deviceAccess {
+		p.socket = deviceAccessSock
+		p.resource = deviceAccessResource
+		p.probe = func(ctx context.Context) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return checkDeviceNode(devicePath)
+		}
+		return p, nil
+	}
+	p.cdiSpec = desiredCDISpec(hypervisor, devicePath)
 	probe := &deviceProbe{}
 	p.probe = func(ctx context.Context) error { return probe.check(ctx, hypervisor, devicePath) }
 	return p, nil
@@ -131,19 +164,19 @@ func NewHyperlightDevicePlugin() (*HyperlightDevicePlugin, error) {
 func desiredCDISpec(hypervisor, devicePath string) []byte {
 	// Get UID/GID from environment, default to 65534 (nobody)
 	// These control the ownership of the device node inside containers
-	uid := defaultDeviceUID
+	uid := uint32(defaultDeviceUID)
 	if uidStr := os.Getenv("DEVICE_UID"); uidStr != "" {
-		if parsed, err := strconv.Atoi(uidStr); err == nil && parsed >= 0 {
-			uid = parsed
+		if parsed, err := strconv.ParseUint(uidStr, 10, 32); err == nil {
+			uid = uint32(parsed)
 		} else {
 			klog.Warningf("Invalid DEVICE_UID '%s', using default %d", uidStr, defaultDeviceUID)
 		}
 	}
 
-	gid := defaultDeviceGID
+	gid := uint32(defaultDeviceGID)
 	if gidStr := os.Getenv("DEVICE_GID"); gidStr != "" {
-		if parsed, err := strconv.Atoi(gidStr); err == nil && parsed >= 0 {
-			gid = parsed
+		if parsed, err := strconv.ParseUint(gidStr, 10, 32); err == nil {
+			gid = uint32(parsed)
 		} else {
 			klog.Warningf("Invalid DEVICE_GID '%s', using default %d", gidStr, defaultDeviceGID)
 		}
@@ -201,13 +234,15 @@ func (p *HyperlightDevicePlugin) ListAndWatch(req *pluginapi.Empty, srv pluginap
 	}()
 	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()
+	if err := p.checkReadiness(srv.Context()); err != nil && srv.Context().Err() != nil {
+		return srv.Context().Err()
+	}
 	previous := ""
 	for {
-		state := pluginapi.Healthy
-		if err := p.checkReadiness(srv.Context()); err != nil {
-			state = pluginapi.Unhealthy
-			klog.Warningf("Allocation readiness failed: %v", err)
-		}
+		p.mu.Lock()
+		state := p.deviceHealthLocked()
+		changed := p.changed
+		p.mu.Unlock()
 		if state != previous {
 			devices := make([]*pluginapi.Device, len(p.devices))
 			for i, device := range p.devices {
@@ -223,7 +258,11 @@ func (p *HyperlightDevicePlugin) ListAndWatch(req *pluginapi.Empty, srv pluginap
 			return nil
 		case <-srv.Context().Done():
 			return srv.Context().Err()
+		case <-changed:
 		case <-ticker.C:
+			if err := p.checkReadiness(srv.Context()); err != nil && srv.Context().Err() != nil {
+				return srv.Context().Err()
+			}
 		}
 	}
 }
@@ -232,6 +271,9 @@ func (p *HyperlightDevicePlugin) ListAndWatch(req *pluginapi.Empty, srv pluginap
 func (p *HyperlightDevicePlugin) Allocate(ctx context.Context, req *pluginapi.AllocateRequest) (*pluginapi.AllocateResponse, error) {
 	klog.V(2).Infof("Allocate called for %d containers", len(req.ContainerRequests))
 	if err := p.checkReadiness(ctx); err != nil {
+		if ctx.Err() != nil {
+			return nil, status.FromContextError(ctx.Err()).Err()
+		}
 		return nil, status.Errorf(codes.Unavailable, "hypervisor allocation is not ready: %v", err)
 	}
 	for _, container := range req.ContainerRequests {
@@ -252,6 +294,16 @@ func (p *HyperlightDevicePlugin) Allocate(ctx context.Context, req *pluginapi.Al
 	responses := make([]*pluginapi.ContainerAllocateResponse, len(req.ContainerRequests))
 
 	for i := range req.ContainerRequests {
+		if p.deviceAccess {
+			responses[i] = &pluginapi.ContainerAllocateResponse{
+				Devices: []*pluginapi.DeviceSpec{{
+					HostPath:      p.devicePath,
+					ContainerPath: p.devicePath,
+					Permissions:   "rw",
+				}},
+			}
+			continue
+		}
 		responses[i] = &pluginapi.ContainerAllocateResponse{
 			// Use CDI device injection
 			CdiDevices: []*pluginapi.CDIDevice{
@@ -280,6 +332,7 @@ func (p *HyperlightDevicePlugin) Start() error {
 	p.mu.Lock()
 	p.stopCh = make(chan struct{})
 	p.registered = false
+	p.readinessKnown = false
 	p.healthServer = health.NewServer()
 	p.updateReadinessLocked()
 	p.mu.Unlock()
@@ -307,6 +360,13 @@ func (p *HyperlightDevicePlugin) Start() error {
 	return nil
 }
 
+func (p *HyperlightDevicePlugin) registrationResource() string {
+	if p.resource != "" {
+		return p.resource
+	}
+	return resourceName
+}
+
 func (p *HyperlightDevicePlugin) Register() error {
 	ctx, cancel := context.WithTimeout(context.Background(), p.registrationTimeout)
 	defer cancel()
@@ -318,7 +378,7 @@ func (p *HyperlightDevicePlugin) Register() error {
 	_, err = pluginapi.NewRegistrationClient(conn).Register(ctx, &pluginapi.RegisterRequest{
 		Version:      pluginapi.Version,
 		Endpoint:     filepath.Base(p.socket),
-		ResourceName: resourceName,
+		ResourceName: p.registrationResource(),
 		Options:      &pluginapi.DevicePluginOptions{},
 	})
 	if err != nil {
@@ -328,7 +388,7 @@ func (p *HyperlightDevicePlugin) Register() error {
 	p.registered = true
 	p.updateReadinessLocked()
 	p.mu.Unlock()
-	klog.Infof("Registered with kubelet as %s", resourceName)
+	klog.Infof("Registered with kubelet as %s", p.registrationResource())
 	return nil
 }
 
@@ -361,21 +421,65 @@ func (p *HyperlightDevicePlugin) updateReadinessLocked() {
 		return
 	}
 	state := healthpb.HealthCheckResponse_NOT_SERVING
-	if p.registered && p.watchers > 0 && p.readinessErr == nil {
+	if p.registered && p.watchers > 0 && p.deviceHealthLocked() == pluginapi.Healthy {
 		state = healthpb.HealthCheckResponse_SERVING
 	}
 	p.healthServer.SetServingStatus("", state)
 }
 
+func (p *HyperlightDevicePlugin) deviceHealthLocked() string {
+	if p.readinessKnown && p.readinessErr == nil {
+		return pluginapi.Healthy
+	}
+	return pluginapi.Unhealthy
+}
+
 func (p *HyperlightDevicePlugin) checkReadiness(ctx context.Context) error {
 	p.mu.Lock()
+	if p.checkGate == nil {
+		p.checkGate = make(chan struct{}, 1)
+	}
+	gate := p.checkGate
+	p.mu.Unlock()
+	select {
+	case gate <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-gate }()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	probe := p.probe
+	p.mu.Unlock()
+	err := probe(ctx)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if err == nil && !p.deviceAccess {
+		err = reconcileCDI(p.cdiPath, p.cdiSpec)
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.readinessErr = p.probe(ctx)
-	if p.readinessErr == nil {
-		p.readinessErr = reconcileCDI(p.cdiPath, p.cdiSpec)
+	previous := p.deviceHealthLocked()
+	p.readinessErr = err
+	p.readinessKnown = true
+	if p.changed == nil {
+		p.changed = make(chan struct{})
+	}
+	if previous != p.deviceHealthLocked() {
+		close(p.changed)
+		p.changed = make(chan struct{})
 	}
 	p.updateReadinessLocked()
-	return p.readinessErr
+	if err != nil {
+		klog.Warningf("Allocation readiness failed: %v", err)
+	}
+	return err
 }
 
 // reconcileCDI owns only the configured file; temporary files have no CDI extension.
@@ -534,6 +638,7 @@ func (p *HyperlightDevicePlugin) watchKubeletRestartPolling() {
 
 func main() {
 	klog.InitFlags(nil)
+	deviceAccess := flag.Bool("device-access", false, "register one bootstrap hypervisor device grant for the main plugin")
 	healthCheck := flag.String("health-check", "", "check liveness or readiness over the plugin socket")
 	probeHypervisor := flag.String("probe-hypervisor", "", "internal bounded device probe")
 	probePath := flag.String("probe-path", "", "internal device probe path")
@@ -547,13 +652,17 @@ func main() {
 		return
 	}
 	if *healthCheck != "" {
-		if err := checkHealth(*healthCheck, serverSock); err != nil {
+		socket := serverSock
+		if *deviceAccess {
+			socket = deviceAccessSock
+		}
+		if err := checkHealth(*healthCheck, socket); err != nil {
 			klog.Error(err)
 			os.Exit(1)
 		}
 		return
 	}
-	plugin, err := NewHyperlightDevicePlugin()
+	plugin, err := newDevicePlugin(*deviceAccess)
 	if err != nil {
 		klog.Fatalf("Failed to create device plugin: %v", err)
 	}
