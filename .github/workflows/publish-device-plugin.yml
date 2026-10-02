@@ -2,14 +2,14 @@ name: Publish Device Plugin
 
 on:
   push:
-    branches: [main]
+    branches: [build/device-plugin-provenance-acceptance]
     paths:
       - 'device-plugin/**'
       - '.github/workflows/publish-device-plugin.yml'
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: hyperlight-dev/hyperlight-device-plugin
+  IMAGE_NAME: antsok/hyperlight-device-plugin-provenance-acceptance
 
 jobs:
   build-and-push:
@@ -43,7 +43,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest
+            type=raw,value=acceptance
             type=sha,prefix=
             type=ref,event=branch
 
